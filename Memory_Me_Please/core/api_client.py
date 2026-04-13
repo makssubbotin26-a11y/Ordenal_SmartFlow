@@ -1,8 +1,12 @@
 import asyncio
 import aiohttp
 import backoff
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Set
 from config.settings import CONFIG
+
+# Адреса API
+DATA_API = "https://data-api.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
 
 
 class PolymarketAPI:
@@ -21,10 +25,9 @@ class PolymarketAPI:
             await self.session.close()
     
     async def _get_with_proxy(self, endpoint: str, params: Dict = None) -> Optional[Dict]:
-        """Внутренний метод для запросов к API"""
+        """Запросы к Gamma API"""
         async with self.semaphore:
             try:
-                # Добавляем заголовки, чтобы API не блокировал запросы как "подозрительные"
                 headers = {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                     'Accept': 'application/json'
@@ -38,68 +41,138 @@ class PolymarketAPI:
                 ) as response:
                     
                     if response.status == 429:
-                        print("[WARNING] Rate limited (429), waiting...")
+                        print("[WARNING] Rate limited, waiting...")
                         raise aiohttp.ClientError("Rate limited")
                     
                     if response.status == 200:
                         return await response.json()
                     else:
-                        print(f"[ERROR] HTTP {response.status} for {endpoint}")
                         return None
                     
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                print(f"[ERROR] Network error: {e}")
                 raise
-    
-    @backoff.on_exception(
-        backoff.expo,
-        (aiohttp.ClientError, asyncio.TimeoutError),
-        max_tries=CONFIG.max_retries
-    )
-    async def get_resolved_events(self, limit: int = 100) -> List[Dict]:
-        """Получение последних завершенных рынков (новый API)"""
-        params = {
-            "limit": limit,
-            "offset": 0
-        }
 
+    # ═══════════════════════════════════════════════════════════════
+    # РЕЖИМ 1: Глобальные лидерборды (быстро, 8к трейдеров)
+    # ═══════════════════════════════════════════════════════════════
+    async def get_global_leaderboard(self, category: str, limit: int = 1000) -> List[Dict]:
+        """
+        Глобальный лидерборд по категории (все время).
+        limit: максимум 1000 (ограничение API)
+        """
+        url = f"{DATA_API}/v1/leaderboard"
+        params = {
+            "category": category,
+            "timePeriod": "ALL",
+            "orderBy": "PNL",
+            "limit": min(limit, 1000)  # API не даст больше 1000
+        }
         
-        print(f"[DEBUG] URL: {self.base_url}{CONFIG.events_endpoint}")
-        print(f"[DEBUG] Params: {params}")
+        print(f"[Global Leaderboard] Загружаю топ-{limit} для {category}...")
         
-        data = await self._get_with_proxy(CONFIG.events_endpoint, params)
+        try:
+            async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and isinstance(data, list):
+                        print(f"[Global Leaderboard] Получено {len(data)} трейдеров")
+                        return data
+                else:
+                    print(f"[Global Leaderboard] HTTP {resp.status}")
+        except Exception as e:
+            print(f"[Global Leaderboard] Error: {e}")
         
-        print(f"[DEBUG] Response preview: {str(data)[:300] if data else 'None'}...")
-        
-        if data is None:
-            print("[ERROR] API returned None")
-            return []
-        
-        # Новый API возвращает прямо список или {markets: [...]}
-        if isinstance(data, list):
-            events = data
-        else:
-            events = data.get("markets") or data.get("events") or []
-        
-        print(f"[INFO] Found {len(events)} markets/events")
-        return events
-    
-    @backoff.on_exception(backoff.expo, aiohttp.ClientError, max_tries=3)
-    async def get_event_positions(self, event_slug: str) -> List[str]:
-        """Получение трейдеров - временно заглушка"""
-        print(f"[DEBUG] Skipping {event_slug[:20]}...")
         return []
 
-    
-    @backoff.on_exception(backoff.expo, aiohttp.ClientError, max_tries=3)
-    async def get_user_stats(self, address: str) -> Optional[Dict]:
-        """Получение статистики пользователя"""
-        endpoint = f"/portfolio/user/{address}/stats"
-        return await self._get_with_proxy(endpoint)
-    
-    @backoff.on_exception(backoff.expo, aiohttp.ClientError, max_tries=3)
-    async def get_portfolio_history(self, address: str) -> Dict[str, Any]:
-        """Получение истории позиций"""
-        endpoint = f"{CONFIG.positions_endpoint}/{address}"
-        data = await self._get_with_proxy(endpoint)
-        return {"positions": data.get("positions", [])} if data else {"positions": []}
+    # ═══════════════════════════════════════════════════════════════
+    # РЕЖИМ 2: По событиям (глубоко, больше трейдеров)
+    # ═══════════════════════════════════════════════════════════════
+    async def get_event_leaderboard(self, condition_id: str, limit: int = 500) -> List[Dict]:
+        """
+        Лидерборд по конкретному событию (conditionId).
+        limit: до 1000, но рекомендую 500 чтобы не перегружать API
+        """
+        if not condition_id:
+            return []
+        
+        url = f"{DATA_API}/v1/leaderboard"
+        params = {
+            "conditionId": condition_id,
+            "timePeriod": "ALL",
+            "orderBy": "PNL",
+            "limit": min(limit, 1000)
+        }
+        
+        try:
+            async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and isinstance(data, list):
+                        return data
+                elif resp.status == 429:
+                    print(f"[Event Leaderboard] Rate limit, ждем...")
+                    await asyncio.sleep(2)
+        except Exception as e:
+            print(f"[Event Leaderboard] Error: {e}")
+        
+        return []
+
+    async def get_active_events(self, category: Optional[str] = None, limit: int = 100) -> List[Dict]:
+        """Получение активных рынков для режима 'по событиям'"""
+        params = {
+            "active": "true",
+            "closed": "false",
+            "limit": limit
+        }
+        if category:
+            params["category"] = category
+            
+        data = await self._get_with_proxy("/markets", params)
+        
+        if data:
+            markets = data if isinstance(data, list) else data.get("markets", [])
+            # Фильтруем только с conditionId
+            return [m for m in markets if m.get("conditionId")]
+        return []
+
+    # ═══════════════════════════════════════════════════════════════
+    # Data API для истории трейдера (используется в обоих режимах)
+    # ═══════════════════════════════════════════════════════════════
+    async def get_user_activity(self, address: str, max_records: int = 5000) -> List[Dict]:
+        """Полная история трейдера (включая закрытые рынки)"""
+        url = f"{DATA_API}/activity"
+        all_activities = []
+        limit = 500
+        offset = 0
+        
+        while len(all_activities) < max_records:
+            params = {
+                "user": address,
+                "limit": limit,
+                "offset": offset,
+                "sortBy": "TIMESTAMP",
+                "sortDirection": "DESC"
+            }
+            
+            try:
+                async with self.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                    if resp.status != 200:
+                        break
+                    
+                    data = await resp.json()
+                    if not data or len(data) == 0:
+                        break
+                    
+                    all_activities.extend(data)
+                    
+                    if len(data) < limit:
+                        break
+                    
+                    offset += limit
+                    await asyncio.sleep(0.5)
+                    
+            except Exception as e:
+                print(f"[Data API Error] {e}")
+                break
+        
+        return all_activities
