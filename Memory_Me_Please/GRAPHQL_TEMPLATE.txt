@@ -1,0 +1,92 @@
+=== The Graph Integration Template ===
+Для: core/api_client.py -> get_event_positions()
+
+1. ENDPOINT (Public):
+https://api.thegraph.com/subgraphs/name/polymarket/polygon-pos
+
+2. GRAPHQL QUERY:
+query GetTradersByMarket($slug: String!, $skip: Int!) {
+  trades(
+    where: {marketSlug: $slug}
+    first: 1000
+    skip: $skip
+    orderBy: timestamp
+    orderDirection: desc
+  ) {
+    id
+    userAddress
+    side
+    size
+    timestamp
+  }
+}
+
+3. PYTHON CODE (вставить в api_client.py):
+async def _graph_query(self, query: str, variables: dict) -> Optional[dict]:
+    """Внутренний метод для GraphQL запросов"""
+    async with self.semaphore:
+        try:
+            async with self.session.post(
+                "https://api.thegraph.com/subgraphs/name/polymarket/polygon-pos",
+                json={"query": query, "variables": variables},
+                headers={"Content-Type": "application/json"},
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    if "errors" in result:
+                        print(f"[GraphQL Error]: {result['errors']}")
+                        return None
+                    return result.get("data")
+                else:
+                    print(f"[HTTP Error]: {response.status}")
+                    return None
+        except Exception as e:
+            print(f"[Network Error]: {e}")
+            return None
+
+async def get_event_positions(self, event_slug: str) -> List[str]:
+    """Получение трейдеров через The Graph"""
+    query = """
+    query GetTraders($slug: String!, $skip: Int!) {
+      trades(
+        where: {marketSlug: $slug}
+        first: 1000
+        skip: $skip
+      ) {
+        userAddress
+      }
+    }
+    """
+    
+    addresses = set()
+    skip = 0
+    
+    while True:
+        data = await self._graph_query(query, {"slug": event_slug, "skip": skip})
+        
+        if not data or not data.get("trades"):
+            break
+            
+        trades = data["trades"]
+        for trade in trades:
+            if trade.get("userAddress"):
+                addresses.add(trade["userAddress"].lower())
+        
+        if len(trades) < 1000:
+            break  # Последняя страница
+        
+        skip += 1000
+        await asyncio.sleep(0.5)  # Rate limiting
+    
+    return list(addresses)
+
+4. ЧТО МОЖЕТ ПОЙТИ НЕ ТАК (завтра чекнем):
+- Поле может называться не "trades", а "orderFills" или "fpmmTrades"
+- marketSlug может быть не "slug", а "marketId" или "conditionId"
+- Может не быть public доступа (тогда нужен API ключ с The Graph Studio)
+
+5. ПРОВЕРКА ЗАПРОСА (в браузере):
+Открой https://graph.org/explorer/ вставь endpoint и query выше, 
+замени $slug на реальный "russia-ukraine-ceasefire-before-gta-vi-554" 
+и проверь, что возвращает.
